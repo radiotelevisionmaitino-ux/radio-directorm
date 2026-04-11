@@ -23,30 +23,79 @@
 </head>
 <body>
 
-    <audio id="reproductor" controls></audio>
+    <audio id="reproductor" controls autoplay></audio>
 
     <script>
         const MASTER_ID = 'maitino-studio-host';
         const reproductor = document.getElementById('reproductor');
+        
+        let peer = null;
+        let pingInterval = null;
 
-        // 1. Iniciamos la conexión P2P de forma silenciosa
-        const peer = new Peer({ config: { 'iceServers': [{ urls: 'stun:stun.l.google.com:19302' }] } });
+        function iniciarReceptor() {
+            // 1. Iniciamos la conexión P2P
+            peer = new Peer({ config: { 'iceServers': [{ urls: 'stun:stun.l.google.com:19302' }] } });
 
-        // 2. Al abrir, avisamos al Estudio para que empiece a emitir
-        peer.on('open', () => {
-            let conn = peer.connect(MASTER_ID, { reliable: true });
-            conn.on('open', () => conn.send({ command: 'check_live' }));
-        });
-
-        // 3. Recibimos el audio y lo inyectamos en el reproductor nativo
-        peer.on('call', (call) => {
-            call.answer();
-            call.on('stream', (stream) => {
-                reproductor.srcObject = stream;
-                // Intentamos reproducir automáticamente (puede requerir que el usuario pulse Play)
-                reproductor.play().catch(() => console.log("Pulsa Play para escuchar"));
+            peer.on('open', () => {
+                conectarAlEstudio();
             });
-        });
+
+            // 2. Recibimos el audio (La llamada del Estudio)
+            peer.on('call', (call) => {
+                call.answer();
+                call.on('stream', (stream) => {
+                    reproductor.srcObject = stream;
+                    
+                    // Intentamos forzar la reproducción
+                    reproductor.play().catch(err => {
+                        console.warn("El navegador bloqueó el autoplay. El usuario debe pulsar el botón de Play manualmente.", err);
+                    });
+                });
+                
+                // Si el estudio corta la llamada, vaciamos el reproductor
+                call.on('close', () => {
+                    reproductor.srcObject = null;
+                });
+            });
+
+            // Si perdemos conexión con el servidor de PeerJS, reconectamos
+            peer.on('disconnected', () => {
+                peer.reconnect();
+            });
+        }
+
+        function conectarAlEstudio() {
+            if (!peer || peer.disconnected) return;
+
+            let conn = peer.connect(MASTER_ID, { reliable: true });
+
+            conn.on('open', () => {
+                // SISTEMA INFALIBLE: En lugar de preguntar una sola vez, 
+                // le preguntamos al estudio cada 3 segundos si está emitiendo.
+                // El estudio (según tu código) lo ignorará si ya nos está enviando el audio.
+                if (pingInterval) clearInterval(pingInterval);
+                
+                pingInterval = setInterval(() => {
+                    if (conn && conn.open) {
+                        conn.send({ command: 'check_live' });
+                    }
+                }, 3000);
+            });
+
+            // Si la conexión de datos se cierra o da error, intentamos reconectar
+            conn.on('close', () => {
+                clearInterval(pingInterval);
+                setTimeout(conectarAlEstudio, 2000);
+            });
+            
+            conn.on('error', () => {
+                clearInterval(pingInterval);
+                setTimeout(conectarAlEstudio, 2000);
+            });
+        }
+
+        // Arrancamos el motor
+        iniciarReceptor();
     </script>
 </body>
 </html>
