@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Directo | Radio Maitino</title>
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <style>
+        /* Fondo negro y reproductor centrado, igual que tu captura */
+        body { 
+            background-color: #000; 
+            margin: 0; 
+            height: 100vh; 
+            display: flex; 
+            justify-content: center; 
+            align-items: center; 
+        }
+        audio {
+            width: 300px;
+            outline: none;
+        }
+    </style>
+</head>
+<body>
+
+    <audio id="reproductor" controls></audio>
+
+    <script>
+        const MASTER_ID = 'maitino-studio-host';
+        const reproductor = document.getElementById('reproductor');
+
+        // 1. Iniciamos la conexión P2P de forma silenciosa
+        const peer = new Peer({ config: { 'iceServers': [{ urls: 'stun:stun.l.google.com:19302' }] } });
+
+        // 2. Al abrir, avisamos al Estudio para que empiece a emitir
+        peer.on('open', () => {
+            let conn = peer.connect(MASTER_ID, { reliable: true });
+            conn.on('open', () => conn.send({ command: 'check_live' }));
+        });
+
+        // 3. Recibimos el audio y lo inyectamos en el reproductor nativo
+        peer.on('call', (call) => {
+            call.answer();
+            call.on('stream', (stream) => {
+                reproductor.srcObject = stream;
+                // Intentamos reproducir automáticamente (puede requerir que el usuario pulse Play)
+                reproductor.play().catch(() => console.log("Pulsa Play para escuchar"));
+            });
+        });
+    </script>
+</body>
+</html>
