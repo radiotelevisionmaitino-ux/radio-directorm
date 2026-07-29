@@ -6,7 +6,6 @@
     <title>Directo | Radio Maitino</title>
     <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
     <style>
-        /* Fondo negro y reproductor centrado, igual que tu captura */
         body { 
             background-color: #000; 
             margin: 0; 
@@ -30,69 +29,81 @@
         const reproductor = document.getElementById('reproductor');
         
         let peer = null;
+        let conn = null;
         let pingInterval = null;
 
         function iniciarReceptor() {
-            // 1. Iniciamos la conexión P2P
+            // Limpieza profunda si venimos de un error previo
+            if (peer) {
+                peer.destroy();
+            }
+
             peer = new Peer({ config: { 'iceServers': [{ urls: 'stun:stun.l.google.com:19302' }] } });
 
             peer.on('open', () => {
                 conectarAlEstudio();
             });
 
-            // 2. Recibimos el audio (La llamada del Estudio)
             peer.on('call', (call) => {
                 call.answer();
                 call.on('stream', (stream) => {
                     reproductor.srcObject = stream;
-                    
-                    // Intentamos forzar la reproducción
-                    reproductor.play().catch(err => {
-                        console.warn("El navegador bloqueó el autoplay. El usuario debe pulsar el botón de Play manualmente.", err);
+                    reproductor.play().catch(() => {
+                        console.warn("Autoplay bloqueado. Requiere pulsar Play manualmente.");
                     });
                 });
                 
-                // Si el estudio corta la llamada, vaciamos el reproductor
-                call.on('close', () => {
-                    reproductor.srcObject = null;
-                });
+                call.on('close', () => { reproductor.srcObject = null; });
+                call.on('error', () => { reproductor.srcObject = null; });
             });
 
-            // Si perdemos conexión con el servidor de PeerJS, reconectamos
+            // Resiliencia 1: Desconexiones leves
             peer.on('disconnected', () => {
-                peer.reconnect();
+                if (!peer.destroyed) peer.reconnect();
+            });
+
+            // Resiliencia 2: Errores fatales (Reinicio completo del motor)
+            peer.on('error', (err) => {
+                console.error("Error en Peer:", err.type);
+                setTimeout(iniciarReceptor, 5000);
             });
         }
 
         function conectarAlEstudio() {
             if (!peer || peer.disconnected) return;
+            if (conn) conn.close();
 
-            let conn = peer.connect(MASTER_ID, { reliable: true });
+            conn = peer.connect(MASTER_ID, { reliable: true });
 
             conn.on('open', () => {
-                // SISTEMA INFALIBLE: En lugar de preguntar una sola vez, 
-                // le preguntamos al estudio cada 3 segundos si está emitiendo.
-                // El estudio (según tu código) lo ignorará si ya nos está enviando el audio.
                 if (pingInterval) clearInterval(pingInterval);
                 
                 pingInterval = setInterval(() => {
+                    // Ping inteligente: Solo avisa al estudio si NO estamos recibiendo audio activo
                     if (conn && conn.open) {
-                        conn.send({ command: 'check_live' });
+                        const noHayAudio = !reproductor.srcObject || !reproductor.srcObject.active;
+                        if (noHayAudio) {
+                            conn.send({ command: 'check_live' });
+                        }
+                    } else {
+                        // Si el canal de datos murió en silencio, intentamos revivirlo
+                        conectarAlEstudio();
                     }
                 }, 3000);
             });
 
-            // Si la conexión de datos se cierra o da error, intentamos reconectar
-            conn.on('close', () => {
-                clearInterval(pingInterval);
-                setTimeout(conectarAlEstudio, 2000);
-            });
-            
-            conn.on('error', () => {
-                clearInterval(pingInterval);
-                setTimeout(conectarAlEstudio, 2000);
-            });
+            conn.on('close', () => setTimeout(conectarAlEstudio, 3000));
+            conn.on('error', () => setTimeout(conectarAlEstudio, 3000));
         }
+
+        // Resiliencia 3: Si el navegador atasca el audio por un microcorte, lo sacudimos
+        reproductor.addEventListener('stalled', () => {
+            if (reproductor.srcObject) {
+                console.warn("Audio atascado. Reenganchando flujo...");
+                reproductor.load();
+                reproductor.play().catch(e => console.error(e));
+            }
+        });
 
         // Arrancamos el motor
         iniciarReceptor();
