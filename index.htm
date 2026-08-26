@@ -4,145 +4,115 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Directo | Radio Maitino</title>
+    <title>Radio Maitino | En Directo</title>
     <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
     <style>
-        body { background: #000; margin: 0; height: 100vh; display: flex; justify-content: center; align-items: center; }
-        audio { width: 90%; max-width: 400px; outline: none; }
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #000000;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            overflow: hidden;
+        }
+        
+        audio {
+            width: 320px;
+            outline: none;
+            border-radius: 30px;
+            box-shadow: 0 5px 15px rgba(255, 255, 255, 0.1);
+        }
     </style>
 </head>
 <body>
-    <audio id="reproductor" controls autoplay playsinline></audio>
 
-    <script>
-        const MASTERS = ['maitino-studio-host-v2', 'maitino-studio-host-bk'];
-        let masterIdx = 0;
-        
-        // 0 = Servidor Privado Render | 1 = Servidor Público Oficial
-        let useRenderServer = true;
+    <audio id="native-player" controls autoplay playsinline></audio>
 
-        const reproductor = document.getElementById('reproductor');
-        let peer = null, conn = null, activeCall = null, checkInterval = null, connectTimeout = null;
+<script>
+    const player = document.getElementById('native-player');
+    
+    const HOST_PRIVADO = 'maitino-studio-host-v2';
+    const HOST_PUBLICO = 'maitino-studio-host-public-v2';
+    
+    let peer;
+    let dataConn;
+    let reconectando = false;
 
-        function crearInstanciaPeer() {
-            if (peer) {
-                try { peer.destroy(); } catch(e){}
+    function iniciarReceptor(usarPublico = false) {
+        let peerConfig = {
+            config: {
+                'iceServers': [
+                    { urls: 'stun:stun.l.google.com:19302' },
+                    { urls: 'stun:global.stun.twilio.com:3478' }
+                ]
             }
+        };
 
-            const baseConfig = {
-                config: {
-                    iceServers: [
-                        { urls: 'stun:stun.l.google.com:19302' },
-                        { urls: 'stun:global.stun.twilio.com:3478' }
-                    ]
-                }
-            };
-
-            // Configuración dinámica de servidor
-            if (useRenderServer) {
-                baseConfig.host = 'maitino-peer-server.onrender.com';
-                baseConfig.port = 443;
-                baseConfig.secure = true;
-                baseConfig.path = '/';
-            }
-
-            peer = new Peer(baseConfig);
-
-            // Temporizador de respaldo: Si Render tarda más de 5s en conectar, pasa al servidor público
-            clearTimeout(connectTimeout);
-            connectTimeout = setTimeout(() => {
-                if (peer && !peer.open && useRenderServer) {
-                    console.warn("Render tardó demasiado. Cambiando al servidor público de PeerJS...");
-                    useRenderServer = false;
-                    crearInstanciaPeer();
-                }
-            }, 5000);
-
-            peer.on('open', () => {
-                clearTimeout(connectTimeout);
-                conectarAlEstudio();
-            });
-
-            peer.on('call', (call) => {
-                if (activeCall) activeCall.close();
-                activeCall = call;
-                call.answer();
-
-                call.on('stream', (stream) => {
-                    reproductor.srcObject = stream;
-                    
-                    // WebRTC es tiempo real. Forzar la reproducción limpia el búfer local al instante
-                    reproductor.play().catch(() => console.warn("Pulsa Play manualmente."));
-                });
-
-                call.on('close', conmutarEntorno);
-                call.on('error', conmutarEntorno);
-            });
-
-            peer.on('disconnected', () => {
-                if (peer && !peer.destroyed) peer.reconnect();
-            });
-
-            peer.on('error', (err) => {
-                console.error("Error PeerJS:", err.type);
-                // Si el servidor Render falla por red o caído, cambiamos a público de inmediato
-                if (useRenderServer && (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error' || err.type === 'socket-closed')) {
-                    useRenderServer = false;
-                }
-                conmutarEntorno();
-            });
+        if (!usarPublico) {
+            peerConfig.host = 'maitino-peer-server.onrender.com';
+            peerConfig.port = 443;
+            peerConfig.secure = true;
         }
 
-        function conmutarEntorno() {
-            masterIdx = (masterIdx === 0) ? 1 : 0; // Alterna Antena Principal <-> Respaldo
-            if (reproductor.srcObject) reproductor.srcObject = null;
+        peer = new Peer(peerConfig);
+
+        peer.on('open', (id) => {
+            const targetHost = usarPublico ? HOST_PUBLICO : HOST_PRIVADO;
             
-            clearInterval(checkInterval);
-            setTimeout(conectarAlEstudio, 1500);
-        }
+            dataConn = peer.connect(targetHost, { reliable: true });
 
-        function conectarAlEstudio() {
-            if (!peer || peer.disconnected || peer.destroyed) {
-                crearInstanciaPeer();
-                return;
-            }
-            if (conn) conn.close();
-
-            const targetHost = MASTERS[masterIdx];
-            conn = peer.connect(targetHost, { reliable: true });
-
-            conn.on('open', () => {
-                clearInterval(checkInterval);
-                checkInterval = setInterval(() => {
-                    if (conn && conn.open) {
-                        const sinAudio = !reproductor.srcObject || !reproductor.srcObject.active;
-                        if (sinAudio) {
-                            conn.send({ command: 'check_live' });
-                        }
-                    } else {
-                        conmutarEntorno();
-                    }
-                }, 3000);
+            dataConn.on('open', () => {
+                dataConn.send({ command: 'check_live' });
             });
 
-            conn.on('close', () => setTimeout(conmutarEntorno, 1500));
-            conn.on('error', () => setTimeout(conmutarEntorno, 1500));
-        }
+            dataConn.on('close', () => programarReconexion());
+        });
 
-        // Forzar enganche al directo exacto si la red del móvil sufre un microcorte
-        function reengancharDirecto() {
-            if (reproductor.srcObject) {
-                const stream = reproductor.srcObject;
-                reproductor.srcObject = stream; // Re-vincula el stream para purgar retardo
-                reproductor.play().catch(() => {});
+        peer.on('call', (call) => {
+            call.answer(null); 
+            
+            call.on('stream', (remoteStream) => {
+                player.srcObject = remoteStream;
+                player.play().catch(e => console.warn("AutoPlay bloqueado. Requiere interacción manual."));
+            });
+
+            call.on('close', () => {
+                player.srcObject = null;
+                programarReconexion();
+            });
+        });
+
+        peer.on('error', (err) => {
+            if (!usarPublico && (err.type === 'network' || err.type === 'server-error' || err.type === 'peer-unavailable')) {
+                console.warn("Servidor privado inactivo. Saltando a red de emergencia...");
+                peer.destroy();
+                iniciarReceptor(true);
+            } else {
+                programarReconexion();
             }
-        }
+        });
 
-        reproductor.addEventListener('stalled', reengancharDirecto);
-        reproductor.addEventListener('waiting', reengancharDirecto);
+        peer.on('disconnected', () => {
+            if (!peer.destroyed) peer.reconnect();
+        });
+    }
 
-        // Iniciar sistema
-        crearInstanciaPeer();
-    </script>
+    function programarReconexion() {
+        if (reconectando) return;
+        reconectando = true;
+        
+        setTimeout(() => {
+            reconectando = false;
+            if (peer) peer.destroy();
+            iniciarReceptor();
+        }, 5000);
+    }
+
+    window.onload = () => iniciarReceptor(false);
+
+</script>
 </body>
 </html>
