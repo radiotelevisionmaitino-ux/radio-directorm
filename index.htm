@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -6,107 +7,142 @@
     <title>Directo | Radio Maitino</title>
     <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
     <style>
-        body { 
-            background-color: #000; 
-            margin: 0; 
-            height: 100vh; 
-            display: flex; 
-            justify-content: center; 
-            align-items: center; 
-        }
-        audio {
-            width: 300px;
-            outline: none;
-        }
+        body { background: #000; margin: 0; height: 100vh; display: flex; justify-content: center; align-items: center; }
+        audio { width: 90%; max-width: 400px; outline: none; }
     </style>
 </head>
 <body>
-
-    <audio id="reproductor" controls autoplay></audio>
+    <audio id="reproductor" controls autoplay playsinline></audio>
 
     <script>
-        const MASTER_ID = 'maitino-studio-host';
-        const reproductor = document.getElementById('reproductor');
+        const MASTERS = ['maitino-studio-host-v2', 'maitino-studio-host-bk'];
+        let masterIdx = 0;
         
-        let peer = null;
-        let conn = null;
-        let pingInterval = null;
+        // 0 = Servidor Privado Render | 1 = Servidor Público Oficial
+        let useRenderServer = true;
 
-        function iniciarReceptor() {
-            // Limpieza profunda si venimos de un error previo
+        const reproductor = document.getElementById('reproductor');
+        let peer = null, conn = null, activeCall = null, checkInterval = null, connectTimeout = null;
+
+        function crearInstanciaPeer() {
             if (peer) {
-                peer.destroy();
+                try { peer.destroy(); } catch(e){}
             }
 
-            peer = new Peer({ config: { 'iceServers': [{ urls: 'stun:stun.l.google.com:19302' }] } });
+            const baseConfig = {
+                config: {
+                    iceServers: [
+                        { urls: 'stun:stun.l.google.com:19302' },
+                        { urls: 'stun:global.stun.twilio.com:3478' }
+                    ]
+                }
+            };
+
+            // Configuración dinámica de servidor
+            if (useRenderServer) {
+                baseConfig.host = 'maitino-peer-server.onrender.com';
+                baseConfig.port = 443;
+                baseConfig.secure = true;
+                baseConfig.path = '/';
+            }
+
+            peer = new Peer(baseConfig);
+
+            // Temporizador de respaldo: Si Render tarda más de 5s en conectar, pasa al servidor público
+            clearTimeout(connectTimeout);
+            connectTimeout = setTimeout(() => {
+                if (peer && !peer.open && useRenderServer) {
+                    console.warn("Render tardó demasiado. Cambiando al servidor público de PeerJS...");
+                    useRenderServer = false;
+                    crearInstanciaPeer();
+                }
+            }, 5000);
 
             peer.on('open', () => {
+                clearTimeout(connectTimeout);
                 conectarAlEstudio();
             });
 
             peer.on('call', (call) => {
+                if (activeCall) activeCall.close();
+                activeCall = call;
                 call.answer();
+
                 call.on('stream', (stream) => {
                     reproductor.srcObject = stream;
-                    reproductor.play().catch(() => {
-                        console.warn("Autoplay bloqueado. Requiere pulsar Play manualmente.");
-                    });
+                    
+                    // WebRTC es tiempo real. Forzar la reproducción limpia el búfer local al instante
+                    reproductor.play().catch(() => console.warn("Pulsa Play manualmente."));
                 });
-                
-                call.on('close', () => { reproductor.srcObject = null; });
-                call.on('error', () => { reproductor.srcObject = null; });
+
+                call.on('close', conmutarEntorno);
+                call.on('error', conmutarEntorno);
             });
 
-            // Resiliencia 1: Desconexiones leves
             peer.on('disconnected', () => {
-                if (!peer.destroyed) peer.reconnect();
+                if (peer && !peer.destroyed) peer.reconnect();
             });
 
-            // Resiliencia 2: Errores fatales (Reinicio completo del motor)
             peer.on('error', (err) => {
-                console.error("Error en Peer:", err.type);
-                setTimeout(iniciarReceptor, 5000);
+                console.error("Error PeerJS:", err.type);
+                // Si el servidor Render falla por red o caído, cambiamos a público de inmediato
+                if (useRenderServer && (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error' || err.type === 'socket-closed')) {
+                    useRenderServer = false;
+                }
+                conmutarEntorno();
             });
         }
 
+        function conmutarEntorno() {
+            masterIdx = (masterIdx === 0) ? 1 : 0; // Alterna Antena Principal <-> Respaldo
+            if (reproductor.srcObject) reproductor.srcObject = null;
+            
+            clearInterval(checkInterval);
+            setTimeout(conectarAlEstudio, 1500);
+        }
+
         function conectarAlEstudio() {
-            if (!peer || peer.disconnected) return;
+            if (!peer || peer.disconnected || peer.destroyed) {
+                crearInstanciaPeer();
+                return;
+            }
             if (conn) conn.close();
 
-            conn = peer.connect(MASTER_ID, { reliable: true });
+            const targetHost = MASTERS[masterIdx];
+            conn = peer.connect(targetHost, { reliable: true });
 
             conn.on('open', () => {
-                if (pingInterval) clearInterval(pingInterval);
-                
-                pingInterval = setInterval(() => {
-                    // Ping inteligente: Solo avisa al estudio si NO estamos recibiendo audio activo
+                clearInterval(checkInterval);
+                checkInterval = setInterval(() => {
                     if (conn && conn.open) {
-                        const noHayAudio = !reproductor.srcObject || !reproductor.srcObject.active;
-                        if (noHayAudio) {
+                        const sinAudio = !reproductor.srcObject || !reproductor.srcObject.active;
+                        if (sinAudio) {
                             conn.send({ command: 'check_live' });
                         }
                     } else {
-                        // Si el canal de datos murió en silencio, intentamos revivirlo
-                        conectarAlEstudio();
+                        conmutarEntorno();
                     }
                 }, 3000);
             });
 
-            conn.on('close', () => setTimeout(conectarAlEstudio, 3000));
-            conn.on('error', () => setTimeout(conectarAlEstudio, 3000));
+            conn.on('close', () => setTimeout(conmutarEntorno, 1500));
+            conn.on('error', () => setTimeout(conmutarEntorno, 1500));
         }
 
-        // Resiliencia 3: Si el navegador atasca el audio por un microcorte, lo sacudimos
-        reproductor.addEventListener('stalled', () => {
+        // Forzar enganche al directo exacto si la red del móvil sufre un microcorte
+        function reengancharDirecto() {
             if (reproductor.srcObject) {
-                console.warn("Audio atascado. Reenganchando flujo...");
-                reproductor.load();
-                reproductor.play().catch(e => console.error(e));
+                const stream = reproductor.srcObject;
+                reproductor.srcObject = stream; // Re-vincula el stream para purgar retardo
+                reproductor.play().catch(() => {});
             }
-        });
+        }
 
-        // Arrancamos el motor
-        iniciarReceptor();
+        reproductor.addEventListener('stalled', reengancharDirecto);
+        reproductor.addEventListener('waiting', reengancharDirecto);
+
+        // Iniciar sistema
+        crearInstanciaPeer();
     </script>
 </body>
 </html>
