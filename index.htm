@@ -2,117 +2,101 @@
 <!DOCTYPE html>
 <html lang="es">
 <head>
+
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Radio Maitino | En Directo</title>
+    <title>Radio Maitino | Sintonizador de Emergencia</title>
     <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
     <style>
-        body {
-            margin: 0;
-            padding: 0;
-            background-color: #000000;
-            height: 100vh;
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-            align-items: center;
-            overflow: hidden;
-        }
-        
-        audio {
-            width: 320px;
-            outline: none;
-            border-radius: 30px;
-            box-shadow: 0 5px 15px rgba(255, 255, 255, 0.1);
-        }
+        body { background: #000; color: #fff; margin: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; font-family: monospace; }
+        audio { width: 300px; margin-top: 20px; }
+        #alert-banner { display: none; background: #ff1a1a; color: #fff; padding: 10px 20px; font-weight: bold; border-radius: 5px; margin-bottom: 15px; }
     </style>
 </head>
 <body>
 
-    <audio id="native-player" controls autoplay playsinline></audio>
+    <div id="alert-banner">⚠️ ALERTA: TONO DE EMERGENCIA DETECTADO</div>
+    <audio id="player" controls autoplay playsinline></audio>
 
 <script>
-    const player = document.getElementById('native-player');
+    const player = document.getElementById('player');
+    const alertBanner = document.getElementById('alert-banner');
     
+    // Servidores de respaldo
     const HOST_PRIVADO = 'maitino-studio-host-v2';
     const HOST_PUBLICO = 'maitino-studio-host-public-v2';
     
-    let peer;
-    let dataConn;
-    let reconectando = false;
+    let peer, dataConn, audioCtx, analyser;
 
-    function iniciarReceptor(usarPublico = false) {
-        let peerConfig = {
-            config: {
-                'iceServers': [
-                    { urls: 'stun:stun.l.google.com:19302' },
-                    { urls: 'stun:global.stun.twilio.com:3478' }
-                ]
-            }
+    function conectar(usarPublico = false) {
+        let config = {
+            config: { 'iceServers': [{ urls: 'stun:stun.l.google.com:19302' }] }
         };
-
         if (!usarPublico) {
-            peerConfig.host = 'maitino-peer-server.onrender.com';
-            peerConfig.port = 443;
-            peerConfig.secure = true;
+            config.host = 'maitino-peer-server.onrender.com';
+            config.port = 443;
+            config.secure = true;
         }
 
-        peer = new Peer(peerConfig);
+        peer = new Peer(config);
 
-        peer.on('open', (id) => {
-            const targetHost = usarPublico ? HOST_PUBLICO : HOST_PRIVADO;
-            
-            dataConn = peer.connect(targetHost, { reliable: true });
-
-            dataConn.on('open', () => {
-                dataConn.send({ command: 'check_live' });
-            });
-
-            dataConn.on('close', () => programarReconexion());
+        peer.on('open', () => {
+            let target = usarPublico ? HOST_PUBLICO : HOST_PRIVADO;
+            dataConn = peer.connect(target, { reliable: true });
+            dataConn.on('open', () => dataConn.send({ command: 'check_live' }));
         });
 
         peer.on('call', (call) => {
-            call.answer(null); 
-            
-            call.on('stream', (remoteStream) => {
-                player.srcObject = remoteStream;
-                player.play().catch(e => console.warn("AutoPlay bloqueado. Requiere interacción manual."));
-            });
-
-            call.on('close', () => {
-                player.srcObject = null;
-                programarReconexion();
+            call.answer(null); // Solo recibir
+            call.on('stream', (stream) => {
+                player.srcObject = stream;
+                player.play().catch(() => {});
+                
+                // Analizador en segundo plano para tonos/ultrasonidos
+                analizarFrecuencias(stream);
             });
         });
 
-        peer.on('error', (err) => {
-            if (!usarPublico && (err.type === 'network' || err.type === 'server-error' || err.type === 'peer-unavailable')) {
-                console.warn("Servidor privado inactivo. Saltando a red de emergencia...");
+        peer.on('error', () => {
+            if (!usarPublico) {
                 peer.destroy();
-                iniciarReceptor(true);
+                conectar(true); // Fallback a la red pública
             } else {
-                programarReconexion();
+                setTimeout(() => conectar(false), 5000);
             }
         });
-
-        peer.on('disconnected', () => {
-            if (!peer.destroyed) peer.reconnect();
-        });
     }
 
-    function programarReconexion() {
-        if (reconectando) return;
-        reconectando = true;
-        
-        setTimeout(() => {
-            reconectando = false;
-            if (peer) peer.destroy();
-            iniciarReceptor();
-        }, 5000);
+    // Detector de tonos de control / ultrasonidos (Ej. 18kHz o 800Hz)
+    function analizarFrecuencias(stream) {
+        try {
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const src = audioCtx.createMediaStreamSource(stream);
+            analyser = audioCtx.createAnalyser();
+            analyser.fftSize = 2048;
+            src.connect(analyser);
+
+            const buffer = new Uint8Array(analyser.frequencyBinCount);
+            
+            function check() {
+                requestAnimationFrame(check);
+                analyser.getByteFrequencyData(buffer);
+                
+                // Índice aproximado para altas frecuencias (ultrasonido ~18kHz en muestra de 48kHz)
+                let highFreqIndex = Math.floor((18000 / (audioCtx.sampleRate / 2)) * analyser.frequencyBinCount);
+                
+                // Si la energía en esa frecuencia supera un umbral, se activa la alerta visual
+                if (buffer[highFreqIndex] > 200) {
+                    alertBanner.style.display = 'block';
+                } else {
+                    alertBanner.style.display = 'none';
+                }
+            }
+            check();
+        } catch(e) {}
     }
 
-    window.onload = () => iniciarReceptor(false);
-
+    window.onload = () => conectar(false);
 </script>
 </body>
 </html>
