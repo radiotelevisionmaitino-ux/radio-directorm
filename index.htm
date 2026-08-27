@@ -2,15 +2,14 @@
 <!DOCTYPE html>
 <html lang="es">
 <head>
-
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Radio Maitino | Sintonizador de Emergencia</title>
+    <title>Sintonizador Maitino</title>
     <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
     <style>
-        body { background: #000; color: #fff; margin: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; font-family: monospace; }
-        audio { width: 300px; margin-top: 20px; }
-        #alert-banner { display: none; background: #ff1a1a; color: #fff; padding: 10px 20px; font-weight: bold; border-radius: 5px; margin-bottom: 15px; }
+        body { background: #000; margin: 0; display: flex; justify-content: center; align-items: center; height: 100vh; overflow: hidden; }
+        #alert-banner { position: absolute; top: 20px; color: red; font-family: monospace; font-weight: bold; display: none; }
+        audio { outline: none; }
     </style>
 </head>
 <body>
@@ -22,16 +21,23 @@
     const player = document.getElementById('player');
     const alertBanner = document.getElementById('alert-banner');
     
-    // Servidores de respaldo
     const HOST_PRIVADO = 'maitino-studio-host-v2';
     const HOST_PUBLICO = 'maitino-studio-host-public-v2';
     
-    let peer, dataConn, audioCtx, analyser;
+    let peer, audioCtx, analyser;
 
     function conectar(usarPublico = false) {
+        if (!audioCtx) {
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (audioCtx.state === 'suspended') {
+            audioCtx.resume();
+        }
+
         let config = {
             config: { 'iceServers': [{ urls: 'stun:stun.l.google.com:19302' }] }
         };
+        
         if (!usarPublico) {
             config.host = 'maitino-peer-server.onrender.com';
             config.port = 443;
@@ -42,35 +48,37 @@
 
         peer.on('open', () => {
             let target = usarPublico ? HOST_PUBLICO : HOST_PRIVADO;
-            dataConn = peer.connect(target, { reliable: true });
-            dataConn.on('open', () => dataConn.send({ command: 'check_live' }));
-        });
+            
+            // Creamos un stream vacío para forzar la llamada desde el receptor
+            const dummyStream = audioCtx.createMediaStreamDestination().stream;
+            const call = peer.call(target, dummyStream);
 
-        peer.on('call', (call) => {
-            call.answer(null); // Solo recibir
-            call.on('stream', (stream) => {
-                player.srcObject = stream;
-                player.play().catch(() => {});
-                
-                // Analizador en segundo plano para tonos/ultrasonidos
-                analizarFrecuencias(stream);
+            call.on('stream', (remoteStream) => {
+                player.srcObject = remoteStream;
+                player.play().catch(() => console.log("Autoplay bloqueado, requiere clic manual"));
+                analizarFrecuencias(remoteStream);
             });
+
+            call.on('error', () => fallback(usarPublico));
+            call.on('close', () => fallback(usarPublico));
         });
 
-        peer.on('error', () => {
-            if (!usarPublico) {
-                peer.destroy();
-                conectar(true); // Fallback a la red pública
-            } else {
-                setTimeout(() => conectar(false), 5000);
-            }
-        });
+        peer.on('error', () => fallback(usarPublico));
     }
 
-    // Detector de tonos de control / ultrasonidos (Ej. 18kHz o 800Hz)
+    function fallback(usarPublico) {
+        if (peer) peer.destroy();
+        if (!usarPublico) {
+            console.log("Fallo en servidor Render, saltando a red pública STUN...");
+            conectar(true);
+        } else {
+            console.log("Sin conexión. Reintentando en 5 segundos...");
+            setTimeout(() => conectar(false), 5000);
+        }
+    }
+
     function analizarFrecuencias(stream) {
         try {
-            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             const src = audioCtx.createMediaStreamSource(stream);
             analyser = audioCtx.createAnalyser();
             analyser.fftSize = 2048;
@@ -81,11 +89,8 @@
             function check() {
                 requestAnimationFrame(check);
                 analyser.getByteFrequencyData(buffer);
-                
-                // Índice aproximado para altas frecuencias (ultrasonido ~18kHz en muestra de 48kHz)
                 let highFreqIndex = Math.floor((18000 / (audioCtx.sampleRate / 2)) * analyser.frequencyBinCount);
                 
-                // Si la energía en esa frecuencia supera un umbral, se activa la alerta visual
                 if (buffer[highFreqIndex] > 200) {
                     alertBanner.style.display = 'block';
                 } else {
@@ -93,10 +98,20 @@
                 }
             }
             check();
-        } catch(e) {}
+        } catch(e) {
+            console.error(e);
+        }
     }
 
+    // Auto-iniciar al cargar la página
     window.onload = () => conectar(false);
+    
+    // Intentar reanudar el contexto de audio si el usuario interactúa con la pantalla
+    document.body.addEventListener('click', () => {
+        if (audioCtx && audioCtx.state === 'suspended') {
+            audioCtx.resume();
+        }
+    }, { once: true });
 </script>
 </body>
 </html>
